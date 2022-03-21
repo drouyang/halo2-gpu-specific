@@ -19,6 +19,7 @@ mod assigned;
 mod circuit;
 mod error;
 mod evaluation;
+mod evaluation_gpu;
 mod keygen;
 mod lookup;
 pub(crate) mod permutation;
@@ -42,10 +43,10 @@ use self::evaluation::Evaluator;
 /// particular circuit.
 #[derive(Debug)]
 pub struct VerifyingKey<C: CurveAffine> {
-    domain: EvaluationDomain<C::Scalar>,
-    fixed_commitments: Vec<C>,
-    permutation: permutation::VerifyingKey<C>,
-    cs: ConstraintSystem<C::Scalar>,
+    pub domain: EvaluationDomain<C::Scalar>,
+    pub fixed_commitments: Vec<C>,
+    pub permutation: permutation::VerifyingKey<C>,
+    pub cs: ConstraintSystem<C::Scalar>,
 }
 
 impl<C: CurveAffine> VerifyingKey<C> {
@@ -137,6 +138,8 @@ pub struct ProvingKey<C: CurveAffine> {
     l_active_row: Polynomial<C::Scalar, ExtendedLagrangeCoeff>,
     fixed_values: Vec<Polynomial<C::Scalar, LagrangeCoeff>>,
     fixed_polys: Vec<Polynomial<C::Scalar, Coeff>>,
+
+    #[cfg(not(feature = "cuda"))]
     fixed_cosets: Vec<Polynomial<C::Scalar, ExtendedLagrangeCoeff>>,
     permutation: permutation::ProvingKey<C>,
     ev: Evaluator<C>,

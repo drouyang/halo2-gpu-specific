@@ -5,10 +5,13 @@ use crate::poly::Rotation;
 use crate::poly::{commitment::Params, Coeff, Polynomial};
 use crate::transcript::{EncodedChallenge, TranscriptWrite};
 
+use ark_std::{start_timer, end_timer};
 use ff::Field;
 use group::Curve;
+use rayon::iter::*;
 use std::io;
 use std::marker::PhantomData;
+use std::sync::Mutex;
 
 /// Create a multi-opening proof
 pub fn create_proof<'a, I, C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptWrite<C, E>>(
@@ -27,27 +30,42 @@ where
         _marker: PhantomData,
     };
 
-    for commitment_at_a_point in commitment_data.iter() {
-        let mut poly_batch = zero();
-        let mut eval_batch = C::Scalar::zero();
-        let z = commitment_at_a_point.point;
-        for query in commitment_at_a_point.queries.iter() {
-            assert_eq!(query.get_point(), z);
+    let mut ws = vec![C::identity(); commitment_data.len()];
 
-            let poly = query.get_commitment().poly;
-            let eval = query.get_eval();
-            poly_batch = poly_batch * *v + poly;
-            eval_batch = eval_batch * *v + eval;
-        }
+    let lock = Mutex::new(0);
 
-        let poly_batch = &poly_batch - eval_batch;
-        let witness_poly = Polynomial {
-            values: kate_division(&poly_batch.values, z),
-            _marker: PhantomData,
-        };
-        let w = params.commit(&witness_poly).to_affine();
+    commitment_data
+        .par_iter()
+        .zip(ws.par_iter_mut())
+        .for_each(|(commitment_at_a_point, w)| {
+            let mut poly_batch = zero();
+            let mut eval_batch = C::Scalar::zero();
+            let z = commitment_at_a_point.point;
+            for query in commitment_at_a_point.queries.iter() {
+                assert_eq!(query.get_point(), z);
+
+                let poly = query.get_commitment().poly;
+                let eval = query.get_eval();
+                poly_batch = poly_batch * *v + poly;
+                eval_batch = eval_batch * *v + eval;
+            }
+
+            let poly_batch = &poly_batch - eval_batch;
+            let witness_poly = Polynomial {
+                values: kate_division(&poly_batch.values, z),
+                _marker: PhantomData,
+            };
+
+            let _guard = lock.lock().unwrap();
+            //let timer = start_timer!(|| "start commit");
+            *w = params.commit(&witness_poly).to_affine();
+            //end_timer!(timer);
+        });
+
+    for w in ws {
         transcript.write_point(w)?;
     }
+
     Ok(())
 }
 

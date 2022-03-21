@@ -1,4 +1,6 @@
+use super::{ConstraintSystem, Expression};
 use crate::multicore;
+use crate::plonk::evaluation_gpu::{LookupProveExpression, ProveExpression};
 use crate::plonk::lookup::prover::Committed;
 use crate::plonk::permutation::Argument;
 use crate::plonk::{lookup, permutation, Any, ProvingKey};
@@ -11,22 +13,26 @@ use crate::{
     },
     transcript::{EncodedChallenge, TranscriptWrite},
 };
+use ark_std::{end_timer, start_timer};
+use ec_gpu_gen::rust_gpu_tools::cuda::Buffer;
 use group::prime::PrimeCurve;
 use group::{
     ff::{BatchInvert, Field},
     Curve,
 };
+use num_bigint::BigUint;
 use std::any::TypeId;
+use std::collections::BTreeSet;
 use std::convert::TryInto;
+use std::iter::FromIterator;
 use std::num::ParseIntError;
-use std::slice;
+use std::str::FromStr;
+use std::{cmp, slice};
 use std::{
     collections::BTreeMap,
     iter,
     ops::{Index, Mul, MulAssign},
 };
-
-use super::{ConstraintSystem, Expression};
 
 /// Return the index in the polynomial of size `isize` after rotation `rot`.
 fn get_rotation_idx(idx: usize, rot: i32, rot_scale: i32, isize: i32) -> usize {
@@ -48,6 +54,7 @@ pub enum ValueSource {
     Instance(usize, usize),
 }
 
+#[cfg(not(feature="cuda"))]
 impl ValueSource {
     /// Get the value for this source
     pub fn get<F: Field, B: Basis>(
@@ -96,6 +103,7 @@ pub enum Calculation {
     Store(ValueSource),
 }
 
+#[cfg(not(feature="cuda"))]
 impl Calculation {
     /// Get the resulting value of this calculation
     pub fn evaluate<F: Field, B: Basis>(
@@ -249,6 +257,10 @@ pub struct Evaluator<C: CurveAffine> {
     pub value_parts: Vec<ValueSource>,
     /// Lookup results
     pub lookup_results: Vec<Calculation>,
+    /// GPU
+    pub gpu_gates_expr: Vec<ProveExpression<C::ScalarExt>>,
+    pub gpu_lookup_expr: Vec<LookupProveExpression<C::ScalarExt>>,
+    pub unit_ref_count: Vec<(usize, u32)>,
 }
 
 /// CaluclationInfo
@@ -263,17 +275,30 @@ pub struct CalculationInfo {
 impl<C: CurveAffine> Evaluator<C> {
     /// Creates a new evaluation structure
     pub fn new(cs: &ConstraintSystem<C::ScalarExt>) -> Self {
+        let mut e = ProveExpression::new();
+
         let mut ev = Evaluator::default();
         ev.add_constant(&C::ScalarExt::zero());
         ev.add_constant(&C::ScalarExt::one());
 
         // Custom gates
+
         for gate in cs.gates.iter() {
             for poly in gate.polynomials().iter() {
                 let vs = ev.add_expression(poly);
                 ev.value_parts.push(vs);
+                e = e.add_gate(poly);
             }
         }
+        e = ProveExpression::reconstruct(e.flatten());
+        let complexity = e.get_complexity();
+        ev.unit_ref_count = complexity.4.into_iter().collect();
+        ev.unit_ref_count.sort_by(|(_, l), (_, r)| u32::cmp(l, r));
+        ev.unit_ref_count.reverse();
+
+        println!("complexity is {:?}", e.get_complexity());
+        println!("ref cnt is {:?}", ev.unit_ref_count);
+        println!("r deep is {}", e.get_r_deep());
 
         // Lookups
         for lookup in cs.lookups.iter() {
@@ -298,6 +323,32 @@ impl<C: CurveAffine> Evaluator<C> {
                 .push(Calculation::LcBeta(compressed_input_coset, right_gamma));
         }
 
+        // Lookups in GPU
+        for lookup in cs.lookups.iter() {
+            let evaluate_lc = |expressions: &Vec<Expression<_>>| {
+                let parts = expressions
+                    .iter()
+                    .map(|expr| LookupProveExpression::Expression(ProveExpression::from_expr(expr)))
+                    .collect::<Vec<_>>();
+                let mut lc = parts[0].clone();
+                for part in parts.into_iter().skip(1) {
+                    lc = LookupProveExpression::LcTheta(Box::new(lc), Box::new(part));
+                }
+                lc
+            };
+            // Input coset
+            let compressed_input_coset = evaluate_lc(&lookup.input_expressions);
+            // table coset
+            let compressed_table_coset = evaluate_lc(&lookup.table_expressions);
+            // z(\omega X) (a'(X) + \beta) (s'(X) + \gamma)
+            let right_gamma = LookupProveExpression::AddGamma(Box::new(compressed_table_coset));
+            ev.gpu_lookup_expr.push(LookupProveExpression::LcBeta(
+                Box::new(compressed_input_coset),
+                Box::new(right_gamma),
+            ));
+        }
+
+        ev.gpu_gates_expr.push(e);
         ev
     }
 
@@ -456,6 +507,7 @@ impl<C: CurveAffine> Evaluator<C> {
     }
 
     /// Evaluate h poly
+    #[cfg(not(feature = "cuda"))]
     pub(in crate::plonk) fn evaluate_h(
         &self,
         pk: &ProvingKey<C>,
@@ -487,12 +539,14 @@ impl<C: CurveAffine> Evaluator<C> {
         // Core expression evaluations
         let num_threads = multicore::current_num_threads();
         let mut table_values_box = ThreadBox::wrap(&mut lookup_values);
+
         for (((advice, instance), lookups), permutation) in advice
             .iter()
             .zip(instance.iter())
             .zip(lookups.iter())
             .zip(permutations.iter())
         {
+            let timer = ark_std::start_timer!(|| "expressions");
             multicore::scope(|scope| {
                 let chunk_size = (size + num_threads - 1) / num_threads;
                 for (thread_idx, values) in values.chunks_mut(chunk_size).enumerate() {
@@ -556,7 +610,9 @@ impl<C: CurveAffine> Evaluator<C> {
                     });
                 }
             });
+            end_timer!(timer);
 
+            let timer = ark_std::start_timer!(|| "permutations");
             // Permutations
             let sets = &permutation.sets;
             if !sets.is_empty() {
@@ -638,9 +694,13 @@ impl<C: CurveAffine> Evaluator<C> {
                     }
                 });
             }
+            end_timer!(timer);
 
-            // Lookups
-            for (n, lookup) in lookups.iter().enumerate() {
+            let timer = ark_std::start_timer!(|| "eval_h_lookups");
+
+            for (lookup_idx, lookup) in lookups.iter().enumerate() {
+                // Lookup constraints
+                let table = &lookup_values[lookup_idx * size..(lookup_idx + 1) * size];
                 // Polynomials required for this lookup.
                 // Calculated here so these only have to be kept in memory for the short time
                 // they are actually needed.
@@ -654,8 +714,6 @@ impl<C: CurveAffine> Evaluator<C> {
                     .domain
                     .coeff_to_extended(lookup.permuted_table_poly.clone());
 
-                // Lookup constraints
-                let table = &lookup_values[n * size..(n + 1) * size];
                 parallelize(&mut values, |values, start| {
                     for (i, value) in values.iter_mut().enumerate() {
                         let idx = start + i;
@@ -675,16 +733,19 @@ impl<C: CurveAffine> Evaluator<C> {
                         //   - z(X) (\theta^{m-1} a_0(X) + ... + a_{m-1}(X) + \beta)
                         //          (\theta^{m-1} s_0(X) + ... + s_{m-1}(X) + \gamma)
                         // ) = 0
+
                         *value = *value * y
                             + ((product_coset[r_next]
                                 * (permuted_input_coset[idx] + beta)
                                 * (permuted_table_coset[idx] + gamma)
                                 - product_coset[idx] * table[idx])
                                 * l_active_row[idx]);
+
                         // Check that the first values in the permuted input expression and permuted
                         // fixed expression are the same.
                         // l_0(X) * (a'(X) - s'(X)) = 0
                         *value = *value * y + (a_minus_s * l0[idx]);
+
                         // Check that each value in the permuted lookup input expression is either
                         // equal to the value above it, or the value at the same index in the
                         // permuted table expression.
@@ -696,7 +757,350 @@ impl<C: CurveAffine> Evaluator<C> {
                     }
                 });
             }
+
+            end_timer!(timer);
         }
+
+        values
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(in crate::plonk) fn evaluate_h(
+        &self,
+        pk: &ProvingKey<C>,
+        advice_poly: Vec<&Vec<Polynomial<C::ScalarExt, Coeff>>>,
+        instance_poly: Vec<&Vec<Polynomial<C::ScalarExt, Coeff>>>,
+        y: C::ScalarExt,
+        beta: C::ScalarExt,
+        gamma: C::ScalarExt,
+        theta: C::ScalarExt,
+        lookups: &[Vec<lookup::prover::Committed<C>>],
+        permutations: &[permutation::prover::Committed<C>],
+    ) -> Polynomial<C::ScalarExt, ExtendedLagrangeCoeff> {
+        assert!(advice_poly.len() == 1);
+
+        let timer = start_timer!(|| "expressions gpu eval");
+        let mut values =
+            pk.ev.gpu_gates_expr[0].eval_gpu(pk, &advice_poly[0], &instance_poly[0], y);
+        end_timer!(timer);
+
+        let domain = &pk.vk.domain;
+        let size = domain.extended_len();
+        let rot_scale = 1 << (domain.extended_k() - domain.k());
+        let fixed = &pk.fixed_polys[..];
+        let extended_omega = domain.get_extended_omega();
+        //let num_lookups = pk.vk.cs.lookups.len();
+        let isize = size as i32;
+        let one = C::ScalarExt::one();
+        let l0 = &pk.l0;
+        let l_last = &pk.l_last;
+        let l_active_row = &pk.l_active_row;
+        let p = &pk.vk.cs.permutation;
+
+        // let mut values = domain.empty_extended();
+        // let mut lookup_values = vec![C::Scalar::zero(); size * num_lookups];
+
+        // Core expression evaluations
+        //let num_threads = multicore::current_num_threads();
+        //let mut table_values_box = ThreadBox::wrap(&mut lookup_values);
+
+        let timer = ark_std::start_timer!(|| "permutations");
+        // Permutations
+        let permutation = &permutations[0];
+        let sets = &permutation.sets;
+        if !sets.is_empty() {
+            let blinding_factors = pk.vk.cs.blinding_factors();
+            let last_rotation = Rotation(-((blinding_factors + 1) as i32));
+            let chunk_len = pk.vk.cs.degree() - 2;
+            let delta_start = beta * &C::Scalar::ZETA;
+
+            let first_set = sets.first().unwrap();
+            let last_set = sets.last().unwrap();
+
+            let mut fixed_map = BTreeMap::new();
+            let mut advice_map = BTreeMap::new();
+            let mut instance_map = BTreeMap::new();
+
+            for column in p.columns.iter() {
+                match column.column_type() {
+                    Any::Advice => {
+                        advice_map.insert(
+                            column.index(),
+                            domain.coeff_to_extended(advice_poly[0][column.index()].clone()),
+                        );
+                    }
+                    Any::Fixed => {
+                        fixed_map.insert(
+                            column.index(),
+                            domain.coeff_to_extended(fixed[column.index()].clone()),
+                        );
+                    }
+                    Any::Instance => {
+                        instance_map.insert(
+                            column.index(),
+                            domain.coeff_to_extended(instance_poly[0][column.index()].clone()),
+                        );
+                    }
+                }
+            }
+
+            // Permutation constraints
+            parallelize(&mut values, |values, start| {
+                let mut beta_term = extended_omega.pow_vartime(&[start as u64, 0, 0, 0]);
+                for (i, value) in values.iter_mut().enumerate() {
+                    let idx = start + i;
+                    let r_next = get_rotation_idx(idx, 1, rot_scale, isize);
+                    let r_last = get_rotation_idx(idx, last_rotation.0, rot_scale, isize);
+
+                    // Enforce only for the first set.
+                    // l_0(X) * (1 - z_0(X)) = 0
+                    *value =
+                        *value * y + ((one - first_set.permutation_product_coset[idx]) * l0[idx]);
+                    // Enforce only for the last set.
+                    // l_last(X) * (z_l(X)^2 - z_l(X)) = 0
+                    *value = *value * y
+                        + ((last_set.permutation_product_coset[idx]
+                            * last_set.permutation_product_coset[idx]
+                            - last_set.permutation_product_coset[idx])
+                            * l_last[idx]);
+                    // Except for the first set, enforce.
+                    // l_0(X) * (z_i(X) - z_{i-1}(\omega^(last) X)) = 0
+                    for (set_idx, set) in sets.iter().enumerate() {
+                        if set_idx != 0 {
+                            *value = *value * y
+                                + ((set.permutation_product_coset[idx]
+                                    - permutation.sets[set_idx - 1].permutation_product_coset
+                                        [r_last])
+                                    * l0[idx]);
+                        }
+                    }
+                    // And for all the sets we enforce:
+                    // (1 - (l_last(X) + l_blind(X))) * (
+                    //   z_i(\omega X) \prod_j (p(X) + \beta s_j(X) + \gamma)
+                    // - z_i(X) \prod_j (p(X) + \delta^j \beta X + \gamma)
+                    // )
+                    let mut current_delta = delta_start * beta_term;
+                    for ((set, columns), cosets) in sets
+                        .iter()
+                        .zip(p.columns.chunks(chunk_len))
+                        .zip(pk.permutation.cosets.chunks(chunk_len))
+                    {
+                        let mut left = set.permutation_product_coset[r_next];
+                        for (values, permutation) in columns
+                            .iter()
+                            .map(|&column| match column.column_type() {
+                                Any::Advice => advice_map.get(&column.index()).unwrap(),
+                                Any::Fixed => fixed_map.get(&column.index()).unwrap(),
+                                Any::Instance => instance_map.get(&column.index()).unwrap(),
+                            })
+                            .zip(cosets.iter())
+                        {
+                            left *= values[idx] + beta * permutation[idx] + gamma;
+                        }
+
+                        let mut right = set.permutation_product_coset[idx];
+                        for values in columns.iter().map(|&column| match column.column_type() {
+                            Any::Advice => advice_map.get(&column.index()).unwrap(),
+                            Any::Fixed => fixed_map.get(&column.index()).unwrap(),
+                            Any::Instance => instance_map.get(&column.index()).unwrap(),
+                        }) {
+                            right *= values[idx] + current_delta + gamma;
+                            current_delta *= &C::Scalar::DELTA;
+                        }
+
+                        *value = *value * y + ((left - right) * l_active_row[idx]);
+                    }
+                    beta_term *= &extended_omega;
+                }
+            });
+        }
+        end_timer!(timer);
+
+        let timer = ark_std::start_timer!(|| "eval_h_lookups");
+        let lookups = &lookups[0];
+        {
+            use ec_gpu_gen::{fft::FftKernel, rust_gpu_tools::Device, rust_gpu_tools::LocalBuffer};
+            use ff::PrimeField;
+            use group::ff::Field;
+            use pairing::bn256::Fr;
+
+            // combine fft with eval_h_lookups:
+            // fft code: from ec-gpu lib.
+            let mut buffer = vec![];
+            buffer.resize(domain.extended_len(), C::Scalar::zero());
+            let closures = ec_gpu_gen::rust_gpu_tools::program_closures!(
+                |program, input: &mut [Fr]| -> ec_gpu_gen::EcResult<()> {
+                    macro_rules! create_buffer_from {
+                        ($x:ident, $y:expr) => {
+                            let $x = program.create_buffer_from_slice($y)?;
+                        };
+                    }
+
+                    let y_beta_gamma = vec![y, beta, gamma];
+
+                    create_buffer_from!(values_buf, input);
+                    create_buffer_from!(l0_buf, l0);
+                    create_buffer_from!(l_last_buf, l_last);
+                    create_buffer_from!(l_active_row_buf, l_active_row);
+                    create_buffer_from!(y_beta_gamma_buf, &y_beta_gamma[..]);
+
+                    const MAX_LOG2_RADIX: u32 = 8;
+                    const LOG2_MAX_ELEMENTS: usize = 32;
+                    const MAX_LOG2_LOCAL_WORK_SIZE: u32 = 7;
+
+                    let buf = vec![pk.vk.domain.get_extended_omega()];
+                    let omega: &[Fr] = unsafe { std::mem::transmute(&buf[..]) };
+                    let omega = omega[0];
+                    let log_n = domain.extended_k();
+                    let n = 1 << log_n;
+                    let mut dst_buffer = unsafe { program.create_buffer::<Fr>(n)? };
+                    let max_deg = cmp::min(MAX_LOG2_RADIX, log_n);
+
+                    // Precalculate:
+                    // [omega^(0/(2^(deg-1))), omega^(1/(2^(deg-1))), ..., omega^((2^(deg-1)-1)/(2^(deg-1)))]
+                    let mut pq = vec![Fr::zero(); 1 << (max_deg - 1)];
+                    let twiddle: Fr = omega.pow_vartime([(n >> max_deg) as u64]);
+                    pq[0] = Fr::one();
+                    if max_deg > 1 {
+                        pq[1] = twiddle;
+                        for i in 2..(1 << max_deg >> 1) {
+                            pq[i] = pq[i - 1];
+                            pq[i].mul_assign(&twiddle);
+                        }
+                    }
+                    let pq_buffer = program.create_buffer_from_slice(&pq)?;
+
+                    // Precalculate [omega, omega^2, omega^4, omega^8, ..., omega^(2^31)]
+                    let mut omegas = vec![omega];
+                    for _ in 1..LOG2_MAX_ELEMENTS {
+                        omegas.push(omegas.last().unwrap().square());
+                    }
+
+                    for (lookup_idx, lookup) in lookups.iter().enumerate() {
+                        let mut ys = vec![C::ScalarExt::one(), y];
+                        let table_buf = pk.ev.gpu_lookup_expr[lookup_idx]
+                            ._eval_gpu(
+                                pk,
+                                program,
+                                &advice_poly[0],
+                                &instance_poly[0],
+                                &mut ys,
+                                beta,
+                                theta,
+                                gamma,
+                            )
+                            .unwrap()
+                            .0;
+
+                        let product_coset = pk
+                            .vk
+                            .domain
+                            .coeff_to_extended_without_fft(lookup.product_poly.clone());
+                        let permuted_input_coset = pk
+                            .vk
+                            .domain
+                            .coeff_to_extended_without_fft(lookup.permuted_input_poly.clone());
+                        let permuted_table_coset = pk
+                            .vk
+                            .domain
+                            .coeff_to_extended_without_fft(lookup.permuted_table_poly.clone());
+
+                        let mut permuted_input_coset_buf =
+                            unsafe { program.create_buffer::<Fr>(size)? };
+                        let mut permuted_table_coset_buf =
+                            unsafe { program.create_buffer::<Fr>(size)? };
+                        let mut product_coset_buf = unsafe { program.create_buffer::<Fr>(size)? };
+
+                        for (src_buffer, data) in vec![
+                            (&mut product_coset_buf, &product_coset),
+                            (&mut permuted_input_coset_buf, &permuted_input_coset),
+                            (&mut permuted_table_coset_buf, &permuted_table_coset),
+                        ] {
+                            buffer[..data.values.len()].copy_from_slice(&data[..]);
+                            program.write_from_buffer(src_buffer, unsafe {
+                                std::mem::transmute::<_, &[Fr]>(&buffer[..])
+                            })?;
+
+                            let omegas_buffer = program.create_buffer_from_slice(&omegas)?;
+
+                            let mut log_p = 0u32;
+                            // Each iteration performs a FFT round
+                            while log_p < log_n {
+                                // 1=>radix2, 2=>radix4, 3=>radix8, ...
+                                let deg = cmp::min(max_deg, log_n - log_p);
+
+                                let n = 1u32 << log_n;
+                                let local_work_size =
+                                    1 << cmp::min(deg - 1, MAX_LOG2_LOCAL_WORK_SIZE);
+                                let global_work_size = n >> deg;
+                                let kernel_name = format!("{}_radix_fft", "Bn256_Fr");
+                                let kernel = program.create_kernel(
+                                    &kernel_name,
+                                    global_work_size as usize,
+                                    local_work_size as usize,
+                                )?;
+                                kernel
+                                    .arg(src_buffer)
+                                    .arg(&dst_buffer)
+                                    .arg(&pq_buffer)
+                                    .arg(&omegas_buffer)
+                                    .arg(&LocalBuffer::<Fr>::new(1 << deg))
+                                    .arg(&n)
+                                    .arg(&log_p)
+                                    .arg(&deg)
+                                    .arg(&max_deg)
+                                    .run()?;
+
+                                log_p += deg;
+                                std::mem::swap(src_buffer, &mut dst_buffer);
+                            }
+                        }
+
+                        let local_work_size = 128;
+                        let global_work_size = size / local_work_size;
+                        let kernel_name = format!("{}_eval_h_lookups", "Bn256_Fr");
+                        let kernel = program.create_kernel(
+                            &kernel_name,
+                            global_work_size as usize,
+                            local_work_size as usize,
+                        )?;
+                        kernel
+                            .arg(&values_buf)
+                            .arg(&table_buf)
+                            .arg(&permuted_input_coset_buf)
+                            .arg(&permuted_table_coset_buf)
+                            .arg(&product_coset_buf)
+                            .arg(&l0_buf)
+                            .arg(&l_last_buf)
+                            .arg(&l_active_row_buf)
+                            .arg(&y_beta_gamma_buf)
+                            .arg(&(rot_scale as u32))
+                            .arg(&(size as u32))
+                            .run()?;
+                    }
+
+                    program.read_into_buffer(&values_buf, input)?;
+
+                    Ok(())
+                }
+            );
+            let devices = Device::all();
+            let programs = devices
+                .iter()
+                .map(|device| ec_gpu_gen::program!(device))
+                .collect::<Result<_, _>>()
+                .expect("Cannot create programs!");
+            let kern = FftKernel::<Fr>::create(programs).expect("Cannot initialize kernel!");
+
+            kern.kernels[0]
+                .program
+                .run(closures, unsafe {
+                    std::mem::transmute::<_, &mut [Fr]>(&mut values.values[..])
+                })
+                .unwrap();
+        }
+        end_timer!(timer);
+
         values
     }
 }
@@ -710,6 +1114,7 @@ unsafe impl<T> Sync for ThreadBox<T> {}
 
 /// Wraps a mutable slice so it can be passed into a thread without
 /// hard to fix borrow checks caused by difficult data access patterns.
+#[cfg(not(feature="cuda"))]
 impl<T> ThreadBox<T> {
     fn wrap(data: &mut [T]) -> Self {
         Self(data.as_mut_ptr(), data.len())
@@ -751,7 +1156,15 @@ pub fn evaluate<F: FieldExt, B: Basis>(
                 },
                 &|a| -a,
                 &|a, b| a + &b,
-                &|a, b| a * b,
+                &|a, b| {
+                    let a = a();
+
+                    if a == F::zero() {
+                        a
+                    } else {
+                        a * b()
+                    }
+                },
                 &|a, scalar| a * scalar,
             );
         }

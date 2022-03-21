@@ -5,7 +5,8 @@
 
 use super::{Coeff, LagrangeCoeff, Polynomial, MSM};
 use crate::arithmetic::{
-    best_fft, best_multiexp, parallelize, CurveAffine, CurveExt, Engine, FieldExt, Group,
+    best_fft, best_multiexp, best_multiexp_gpu_cond, parallelize, CurveAffine,
+    CurveExt, Engine, FieldExt, Group,
 };
 use crate::helpers::CurveRead;
 
@@ -30,12 +31,12 @@ pub struct Params<C: CurveAffine> {
 /// These are the verifier parameters for the polynomial commitment scheme.
 #[derive(Debug)]
 pub struct ParamsVerifier<E: Engine> {
-    pub(crate) k: u32,
-    pub(crate) n: u64,
-    pub(crate) g1: E::G1Affine,
-    pub(crate) g2: E::G2Affine,
-    pub(crate) s_g2: E::G2Affine,
-    pub(crate) g_lagrange: Vec<E::G1Affine>,
+    pub k: u32,
+    pub n: u64,
+    pub g1: E::G1Affine,
+    pub g2: E::G2Affine,
+    pub s_g2: E::G2Affine,
+    pub g_lagrange: Vec<E::G1Affine>,
 }
 
 #[cfg(test)]
@@ -131,7 +132,7 @@ impl<C: CurveAffine> Params<C> {
         let bases = &self.g;
         let size = scalars.len();
         assert!(bases.len() >= size);
-        best_multiexp(&scalars, &bases[0..size])
+        best_multiexp_gpu_cond(&scalars, &bases[0..size])
     }
 
     /// This commits to a polynomial using its evaluations over the $2^k$ size
@@ -143,7 +144,7 @@ impl<C: CurveAffine> Params<C> {
         let bases = &self.g_lagrange;
         let size = scalars.len();
         assert!(bases.len() >= size);
-        best_multiexp(&scalars, &bases[0..size])
+        best_multiexp_gpu_cond(&scalars, &bases[0..size])
     }
 
     /// Generates an empty multiscalar multiplication struct using the
@@ -305,7 +306,7 @@ impl<E: Engine> ParamsVerifier<E> {
         let bases = &self.g_lagrange;
         let size = scalars.len();
         assert!(bases.len() >= size);
-        best_multiexp(&scalars, &bases[0..size])
+        best_multiexp_gpu_cond(&scalars, &bases[0..size])
     }
 
     /// Writes params to a buffer.

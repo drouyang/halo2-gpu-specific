@@ -2,12 +2,13 @@
 //! domain that is of a suitable size for the application.
 
 use crate::{
-    arithmetic::{best_fft, parallelize, FieldExt, Group},
+    arithmetic::{best_fft, parallelize, FieldExt, Group, batch_invert},
     plonk::Assigned,
 };
 
-use super::{Coeff, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, Rotation};
+use super::{Coeff, ExtendedLagrangeCoeff, LagrangeCoeff, Polynomial, Rotation, PreparedExtendedLagrangeCoeff};
 
+use ark_std::{start_timer, end_timer};
 use group::ff::{BatchInvert, Field, PrimeField};
 
 use std::marker::PhantomData;
@@ -42,6 +43,8 @@ impl<G: Group> EvaluationDomain<G> {
 
         // n = 2^k
         let n = 1u64 << k;
+
+        println!("quotient_poly_degree {}", quotient_poly_degree);
 
         // We need to work within an extended domain, not params.k but params.k + i
         // for some integer i such that 2^(params.k + i) is sufficiently large to
@@ -243,9 +246,26 @@ impl<G: Group> EvaluationDomain<G> {
     ) -> Polynomial<G, ExtendedLagrangeCoeff> {
         assert_eq!(a.values.len(), 1 << self.k);
 
+        //let timer = start_timer!(|| format!("prepare {}", self.k));
         self.distribute_powers_zeta(&mut a.values, true);
+        //end_timer!(timer);
+
         a.values.resize(self.extended_len(), G::group_zero());
         best_fft(&mut a.values, self.extended_omega, self.extended_k);
+
+        Polynomial {
+            values: a.values,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn coeff_to_extended_without_fft(
+        &self,
+        mut a: Polynomial<G, Coeff>,
+    ) -> Polynomial<G, PreparedExtendedLagrangeCoeff> {
+        assert_eq!(a.values.len(), 1 << self.k);
+
+        self.distribute_powers_zeta(&mut a.values, true);
 
         Polynomial {
             values: a.values,
@@ -447,7 +467,7 @@ impl<G: Group> EvaluationDomain<G> {
                 let result = x - self.rotate_omega(G::Scalar::one(), rotation);
                 results.push(result);
             }
-            results.iter_mut().batch_invert();
+            batch_invert(&mut results);
         }
 
         let common = (xn - G::Scalar::one()) * self.barycentric_weight;

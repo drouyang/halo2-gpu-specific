@@ -1,14 +1,19 @@
 //! This module provides common utilities, traits and structures for group,
 //! field and polynomial arithmetic.
 
+use std::{ops::Mul, sync::Arc};
+
 use super::multicore;
+use ark_std::{end_timer, start_timer};
 pub use ff::Field;
 use group::{
+    cofactor::CofactorCurveAffine,
     ff::{BatchInvert, PrimeField},
     Group as _,
 };
-
 pub use pairing::arithmetic::*;
+use pairing::bn256::G1Affine;
+use rayon::prelude::*;
 
 fn multiexp_serial<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C], acc: &mut C::Curve) {
     let coeffs: Vec<_> = coeffs.iter().map(|a| a.to_repr()).collect();
@@ -124,6 +129,227 @@ pub fn small_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::C
     acc
 }
 
+#[cfg(feature = "cuda")]
+pub fn gpu_multiexp_multikernel<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
+    use ec_gpu_gen::{
+        fft::FftKernel, multiexp::MultiexpKernel, rust_gpu_tools::Device, threadpool::Worker,
+    };
+    use group::Curve;
+    use pairing::bn256::Fr;
+
+    let timer = start_timer!(|| format!("msm {}", coeffs.len()));
+
+    let devices = Device::all();
+    let programs = devices
+        .iter()
+        .map(|device| ec_gpu_gen::program!(device))
+        .collect::<Result<_, _>>()
+        .expect("Cannot create programs!");
+    let mut kern =
+        MultiexpKernel::<G1Affine>::create(programs, &devices).expect("Cannot initialize kernel!");
+    let pool = Worker::new();
+
+    let _coeffs = [Arc::new(
+        coeffs.iter().map(|x| x.to_repr()).collect::<Vec<_>>(),
+    )];
+    let _coeffs: &Arc<Vec<[u8; 32]>> = unsafe { std::mem::transmute(&_coeffs) };
+    let bases: &[G1Affine] = unsafe { std::mem::transmute(bases) };
+    let bases = Arc::new(Vec::from(bases));
+
+    let a = [kern.multiexp(&pool, bases, _coeffs.clone(), 0).unwrap()];
+    let res: &[C::Curve] = unsafe { std::mem::transmute(&a[..]) };
+    end_timer!(timer);
+    res[0]
+}
+
+#[cfg(feature = "cuda")]
+pub fn gpu_sort<F: FieldExt>(input: &mut Vec<F>, log_n: u32) {
+    use ec_gpu_gen::{
+        fft::FftKernel,
+        multiexp::SingleMultiexpKernel,
+        rust_gpu_tools::{program_closures, Device},
+        threadpool::Worker,
+        EcResult,
+    };
+    use group::Curve;
+    use pairing::bn256::Fr;
+
+    let closures = program_closures!(|program, input: &mut [Fr]| -> EcResult<()> {
+        let buffer = program.create_buffer_from_slice(input)?;
+
+        let local_work_size = 128;
+        let global_work_size = (1 << log_n - 1) / local_work_size;
+        let kernel_name = format!("{}_sort", "Bn256_Fr");
+        for i in 0..log_n {
+            for j in 0..=i {
+                let kernel = program.create_kernel(
+                    &kernel_name,
+                    global_work_size as usize,
+                    local_work_size as usize,
+                )?;
+                kernel.arg(&buffer).arg(&i).arg(&j).run()?;
+            }
+        }
+
+        program.read_into_buffer(&buffer, input)?;
+        Ok(())
+    });
+
+    let devices = Device::all();
+    let programs = devices
+        .iter()
+        .map(|device| ec_gpu_gen::program!(device))
+        .collect::<Result<_, _>>()
+        .expect("Cannot create programs!");
+    let kern = FftKernel::<Fr>::create(programs).expect("Cannot initialize kernel!");
+
+    gpu_unmont(input);
+
+    kern.kernels[0]
+        .program
+        .run(closures, unsafe {
+            std::mem::transmute::<_, &mut [Fr]>(&mut input[..])
+        })
+        .unwrap();
+
+    gpu_mont(input);
+}
+
+#[cfg(feature = "cuda")]
+pub fn gpu_unmont<F: FieldExt>(input: &mut [F]) {
+    use ec_gpu_gen::{
+        fft::FftKernel,
+        multiexp::SingleMultiexpKernel,
+        rust_gpu_tools::{program_closures, Device},
+        threadpool::Worker,
+        EcResult,
+    };
+    use group::Curve;
+    use pairing::bn256::Fr;
+
+    let closures = program_closures!(|program, input: &mut [Fr]| -> EcResult<()> {
+        let buffer = program.create_buffer_from_slice(input)?;
+
+        let local_work_size = 128;
+        let global_work_size = input.len() / local_work_size;
+
+        let kernel_name = format!("{}_batch_unmont", "Bn256_Fr");
+        let kernel = program.create_kernel(
+            &kernel_name,
+            global_work_size as usize,
+            local_work_size as usize,
+        )?;
+        kernel.arg(&buffer).run()?;
+
+        program.read_into_buffer(&buffer, input)?;
+        Ok(())
+    });
+
+    let devices = Device::all();
+    let programs = devices
+        .iter()
+        .map(|device| ec_gpu_gen::program!(device))
+        .collect::<Result<_, _>>()
+        .expect("Cannot create programs!");
+    let kern = FftKernel::<Fr>::create(programs).expect("Cannot initialize kernel!");
+
+    kern.kernels[0]
+        .program
+        .run(closures, unsafe {
+            std::mem::transmute::<_, &mut [Fr]>(&mut input[..])
+        })
+        .unwrap();
+}
+
+#[cfg(feature = "cuda")]
+pub fn gpu_mont<F: FieldExt>(input: &mut [F]) {
+    use ec_gpu_gen::{
+        fft::FftKernel,
+        multiexp::SingleMultiexpKernel,
+        rust_gpu_tools::{program_closures, Device},
+        threadpool::Worker,
+        EcResult,
+    };
+    use group::Curve;
+    use pairing::bn256::Fr;
+
+    let closures = program_closures!(|program, input: &mut [Fr]| -> EcResult<()> {
+        let buffer = program.create_buffer_from_slice(input)?;
+
+        let local_work_size = 128;
+        let global_work_size = input.len() / local_work_size;
+
+        let kernel_name = format!("{}_batch_mont", "Bn256_Fr");
+        let kernel = program.create_kernel(
+            &kernel_name,
+            global_work_size as usize,
+            local_work_size as usize,
+        )?;
+        kernel.arg(&buffer).run()?;
+
+        program.read_into_buffer(&buffer, input)?;
+        Ok(())
+    });
+
+    let devices = Device::all();
+    let programs = devices
+        .iter()
+        .map(|device| ec_gpu_gen::program!(device))
+        .collect::<Result<_, _>>()
+        .expect("Cannot create programs!");
+    let kern = FftKernel::<Fr>::create(programs).expect("Cannot initialize kernel!");
+
+    kern.kernels[0]
+        .program
+        .run(closures, unsafe {
+            std::mem::transmute::<_, &mut [Fr]>(&mut input[..])
+        })
+        .unwrap();
+}
+
+#[cfg(feature = "cuda")]
+pub fn gpu_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
+    use ec_gpu_gen::{
+        fft::FftKernel, multiexp::SingleMultiexpKernel, rust_gpu_tools::Device, threadpool::Worker,
+    };
+    use group::Curve;
+    use pairing::bn256::Fr;
+
+    //let timer = start_timer!(|| "to repr");
+    let mut _coeffs = vec![C::Scalar::zero().to_repr(); coeffs.len()];
+    parallelize(&mut _coeffs[..], |c, start| {
+        for (i, c) in c.iter_mut().enumerate() {
+            *c = coeffs[i + start].to_repr();
+        }
+    });
+    //end_timer!(timer);
+    let _coeffs: &[[u8; 32]] = unsafe { std::mem::transmute(&_coeffs[..coeffs.len()]) };
+    let bases: &[G1Affine] = unsafe { std::mem::transmute(bases) };
+
+    let device = Device::all()[0];
+    let programs = ec_gpu_gen::program!(device).unwrap();
+    let kern = SingleMultiexpKernel::<G1Affine>::create(programs, device, None)
+        .expect("Cannot initialize kernel!");
+
+    let a = [kern.multiexp(bases, _coeffs).unwrap()];
+    let res: &[C::Curve] = unsafe { std::mem::transmute(&a[..]) };
+    res[0]
+}
+
+pub fn best_multiexp_gpu_cond<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Curve {
+    if coeffs.len() > 1 << 14 {
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "cuda")] {
+                gpu_multiexp(coeffs, bases)
+            } else {
+                best_multiexp(coeffs, bases)
+            }
+        }
+    } else {
+        best_multiexp(coeffs, bases)
+    }
+}
+
 /// Performs a multi-exponentiation operation.
 ///
 /// This function will panic if coeffs and bases have a different length.
@@ -158,6 +384,23 @@ pub fn best_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Cu
     }
 }
 
+#[cfg(feature = "cuda")]
+pub fn gpu_fft<G: Group>(a: &mut [G], omega: G::Scalar, log_n: u32) {
+    use ec_gpu_gen::{fft::FftKernel, rust_gpu_tools::Device};
+    use pairing::bn256::Fr;
+    let devices = Device::all();
+    let programs = devices
+        .iter()
+        .map(|device| ec_gpu_gen::program!(device))
+        .collect::<Result<_, _>>()
+        .expect("Cannot create programs!");
+    let mut kern = FftKernel::<Fr>::create(programs).expect("Cannot initialize kernel!");
+    let a: &mut [Fr] = unsafe { std::mem::transmute(a) };
+    let omega: &Fr = unsafe { std::mem::transmute(&omega) };
+    kern.radix_fft_many(&mut [a], &[*omega], &[log_n])
+        .expect("GPU FFT failed!");
+}
+
 /// Performs a radix-$2$ Fast-Fourier Transformation (FFT) on a vector of size
 /// $n = 2^k$, when provided `log_n` = $k$ and an element of multiplicative
 /// order $n$ called `omega` ($\omega$). The result is that the vector `a`, when
@@ -169,18 +412,17 @@ pub fn best_multiexp<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Cu
 ///
 /// This will use multithreading if beneficial.
 pub fn best_fft<G: Group>(a: &mut [G], omega: G::Scalar, log_n: u32) {
-    let threads = multicore::current_num_threads();
-    let log_threads = log2_floor(threads);
-
-    if log_n <= log_threads {
-        serial_fft(a, omega, log_n);
-    } else {
-        parallel_fft(a, omega, log_n, log_threads);
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "cuda")]{
+            return gpu_fft(a, omega, log_n);
+        } else {
+            return best_fft_cpu(a, omega, log_n);
+        }
     }
 }
 
-fn serial_fft<G: Group>(a: &mut [G], omega: G::Scalar, log_n: u32) {
-    fn bitreverse(mut n: u32, l: u32) -> u32 {
+pub fn best_fft_cpu<G: Group>(a: &mut [G], omega: G::Scalar, log_n: u32) {
+    fn bitreverse(mut n: usize, l: usize) -> usize {
         let mut r = 0;
         for _ in 0..l {
             r = (r << 1) | (n & 1);
@@ -189,79 +431,144 @@ fn serial_fft<G: Group>(a: &mut [G], omega: G::Scalar, log_n: u32) {
         r
     }
 
-    let n = a.len() as u32;
+    let threads = multicore::current_num_threads();
+    let log_threads = log2_floor(threads);
+    let n = a.len() as usize;
     assert_eq!(n, 1 << log_n);
 
     for k in 0..n {
-        let rk = bitreverse(k, log_n);
+        let rk = bitreverse(k, log_n as usize);
         if k < rk {
-            a.swap(rk as usize, k as usize);
+            a.swap(rk, k);
         }
     }
 
-    let mut m = 1;
-    for _ in 0..log_n {
-        let w_m = omega.pow_vartime(&[u64::from(n / (2 * m)), 0, 0, 0]);
+    //let timer1 = start_timer!(|| format!("prepare do fft {}", log_n));
+    // precompute twiddle factors
+    let mut twiddles: Vec<_> = (0..(n / 2) as usize)
+        .into_iter()
+        .map(|_| G::Scalar::one())
+        .collect();
 
-        let mut k = 0;
-        while k < n {
-            let mut w = G::Scalar::one();
-            for j in 0..m {
-                let mut t = a[(k + j + m) as usize];
-                t.group_scale(&w);
-                a[(k + j + m) as usize] = a[(k + j) as usize];
-                a[(k + j + m) as usize].group_sub(&t);
-                a[(k + j) as usize].group_add(&t);
-                w *= &w_m;
-            }
+    let chunck_size = 1 << 14;
+    let block_size = 1 << 10;
 
-            k += 2 * m;
+    if n / 2 < chunck_size {
+        for i in 1..n / 2 {
+            twiddles[i] = twiddles[i - 1] * omega;
+        }
+    } else {
+        for i in 1..chunck_size {
+            twiddles[i] = twiddles[i - 1] * omega;
         }
 
-        m *= 2;
+        let base = twiddles[chunck_size - 1] * omega;
+        let mut chunks = twiddles.chunks_mut(chunck_size);
+        let mut prev = chunks.next().unwrap();
+
+        chunks.for_each(|curr| {
+            curr.par_chunks_mut(block_size)
+                .enumerate()
+                .for_each(|(i, v)| {
+                    v.iter_mut().enumerate().for_each(|(j, v)| {
+                        *v = base * prev[i * block_size + j];
+                    });
+                });
+            prev = curr;
+        });
+    }
+
+    if log_n <= log_threads {
+        let mut chunk = 2_usize;
+        let mut twiddle_chunk = (n / 2) as usize;
+        for _ in 0..log_n {
+            a.chunks_mut(chunk).for_each(|coeffs| {
+                let (left, right) = coeffs.split_at_mut(chunk / 2);
+
+                // case when twiddle factor is one
+                let (a, left) = left.split_at_mut(1);
+                let (b, right) = right.split_at_mut(1);
+                let t = b[0];
+                b[0] = a[0];
+                a[0].group_add(&t);
+                b[0].group_sub(&t);
+
+                left.iter_mut()
+                    .zip(right.iter_mut())
+                    .enumerate()
+                    .for_each(|(i, (a, b))| {
+                        let mut t = *b;
+                        t.group_scale(&twiddles[(i + 1) * twiddle_chunk]);
+                        *b = *a;
+                        a.group_add(&t);
+                        b.group_sub(&t);
+                    });
+            });
+            chunk *= 2;
+            twiddle_chunk /= 2;
+        }
+    } else {
+        recursive_butterfly_arithmetic(a, n, 1, &twiddles, 0)
     }
 }
 
-fn parallel_fft<G: Group>(a: &mut [G], omega: G::Scalar, log_n: u32, log_threads: u32) {
-    assert!(log_n >= log_threads);
+pub fn recursive_butterfly_arithmetic<G: Group>(
+    a: &mut [G],
+    n: usize,
+    twiddle_chunk: usize,
+    twiddles: &[G::Scalar],
+    level: u32,
+) {
+    if n == 2 {
+        let t = a[1];
+        a[1] = a[0];
+        a[0].group_add(&t);
+        a[1].group_sub(&t);
+    } else {
+        let (left, right) = a.split_at_mut(n / 2);
 
-    let num_threads = 1 << log_threads;
-    let log_new_n = log_n - log_threads;
-    let mut tmp = vec![vec![G::group_zero(); 1 << log_new_n]; num_threads];
-    let new_omega = omega.pow_vartime(&[num_threads as u64, 0, 0, 0]);
+        rayon::join(
+            || recursive_butterfly_arithmetic(left, n / 2, twiddle_chunk * 2, twiddles, level + 1),
+            || recursive_butterfly_arithmetic(right, n / 2, twiddle_chunk * 2, twiddles, level + 1),
+        );
 
-    multicore::scope(|scope| {
-        let a = &*a;
+        // case when twiddle factor is one
+        let (a, left) = left.split_at_mut(1);
+        let (b, right) = right.split_at_mut(1);
+        let t = b[0];
+        b[0] = a[0];
+        a[0].group_add(&t);
+        b[0].group_sub(&t);
 
-        for (j, tmp) in tmp.iter_mut().enumerate() {
-            scope.spawn(move |_| {
-                // Shuffle into a sub-FFT
-                let omega_j = omega.pow_vartime(&[j as u64, 0, 0, 0]);
-                let omega_step = omega.pow_vartime(&[(j as u64) << log_new_n, 0, 0, 0]);
-
-                let mut elt = G::Scalar::one();
-
-                for (i, tmp) in tmp.iter_mut().enumerate() {
-                    for s in 0..num_threads {
-                        let idx = (i + (s << log_new_n)) % (1 << log_n);
-                        let mut t = a[idx];
-                        t.group_scale(&elt);
-                        tmp.group_add(&t);
-                        elt *= &omega_step;
-                    }
-                    elt *= &omega_j;
-                }
-
-                // Perform sub-FFT
-                serial_fft(tmp, new_omega, log_new_n);
-            });
+        let chunk_size = 512;
+        if n > chunk_size << 2 && level < 4 {
+            left.par_chunks_mut(chunk_size)
+                .zip(right.par_chunks_mut(chunk_size))
+                .enumerate()
+                .for_each(|(i, (left, right))| {
+                    left.iter_mut()
+                        .zip(right.iter_mut())
+                        .enumerate()
+                        .for_each(|(j, (a, b))| {
+                            let mut t = *b;
+                            t.group_scale(&twiddles[(i * chunk_size + j + 1) * twiddle_chunk]);
+                            *b = *a;
+                            a.group_add(&t);
+                            b.group_sub(&t);
+                        });
+                });
+        } else {
+            left.iter_mut()
+                .zip(right.iter_mut())
+                .enumerate()
+                .for_each(|(i, (a, b))| {
+                    let mut t = *b;
+                    t.group_scale(&twiddles[(i + 1) * twiddle_chunk]);
+                    *b = *a;
+                    a.group_add(&t);
+                    b.group_sub(&t);
+                });
         }
-    });
-
-    // Unshuffle
-    let mask = (1 << log_threads) - 1;
-    for (idx, a) in a.iter_mut().enumerate() {
-        *a = tmp[idx & mask][idx >> log_threads];
     }
 }
 
@@ -364,6 +671,44 @@ fn log2_floor(num: usize) -> u32 {
     pow
 }
 
+pub fn mul_acc<F: FieldExt>(f: &mut [F]) {
+    let num_threads = multicore::current_num_threads();
+    let len = f.len();
+
+    if len < num_threads * 16 {
+        for i in 0..f.len() - 1 {
+            f[i + 1] = f[i] * f[i + 1];
+        }
+    } else {
+        let chunk_size = len / 4;
+        let chunk_acc = f
+            .par_chunks_mut(chunk_size)
+            .map(|chunk| {
+                chunk[0] = chunk[0];
+                for j in 1..chunk.len() {
+                    chunk[j] = chunk[j - 1] * chunk[j];
+                }
+                chunk.last().unwrap().clone()
+            })
+            .collect::<Vec<_>>();
+
+        let mut acc = chunk_acc[0];
+        for (chunk, curr_acc) in f.chunks_mut(chunk_size).zip(chunk_acc.into_iter()).skip(1) {
+            chunk.par_iter_mut().for_each(|p| {
+                *p = *p * acc;
+            });
+
+            acc *= curr_acc;
+        }
+    }
+}
+
+pub fn batch_invert<F: FieldExt>(f: &mut [F]) {
+    parallelize(f, |start, _| {
+        start.batch_invert();
+    });
+}
+
 /// Returns coefficients of an n - 1 degree polynomial given a set of n points
 /// and their evaluations. This function will panic if two values in `points`
 /// are the same.
@@ -386,8 +731,9 @@ pub fn lagrange_interpolate<F: FieldExt>(points: &[F], evals: &[F]) -> Vec<F> {
             }
             denoms.push(denom);
         }
+
         // Compute (x_j - x_k)^(-1) for each j != i
-        denoms.iter_mut().flat_map(|v| v.iter_mut()).batch_invert();
+        denoms.iter_mut().for_each(|v| batch_invert(v));
 
         let mut final_poly = vec![F::zero(); points.len()];
         for (j, (denoms, eval)) in denoms.into_iter().zip(evals.iter()).enumerate() {
@@ -422,7 +768,7 @@ pub fn lagrange_interpolate<F: FieldExt>(points: &[F], evals: &[F]) -> Vec<F> {
     }
 }
 
-pub(crate) fn evaluate_vanishing_polynomial<F: FieldExt>(roots: &[F], z: F) -> F {
+pub(crate) fn _evaluate_vanishing_polynomial<F: FieldExt>(roots: &[F], z: F) -> F {
     fn evaluate<F: FieldExt>(roots: &[F], z: F) -> F {
         roots.iter().fold(F::one(), |acc, point| (z - point) * acc)
     }
@@ -447,6 +793,7 @@ use rand_core::OsRng;
 
 #[cfg(test)]
 use pairing::bn256::Fr as Fp;
+use rayon::prelude::IntoParallelRefIterator;
 
 #[test]
 fn test_lagrange_interpolate() {

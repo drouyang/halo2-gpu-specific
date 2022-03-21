@@ -3,6 +3,7 @@
 
 use blake2b_simd::{Params as Blake2bParams, State as Blake2bState};
 use group::ff::PrimeField;
+use num_bigint::BigUint;
 use std::convert::TryInto;
 
 use crate::arithmetic::{BaseExt, Coordinates, CurveAffine, FieldExt};
@@ -60,6 +61,8 @@ pub trait TranscriptWrite<C: CurveAffine, E: EncodedChallenge<C>>: Transcript<C,
     /// Write a scalar to the proof and the transcript.
     fn write_scalar(&mut self, scalar: C::Scalar) -> io::Result<()>;
 }
+
+// ----------------------Blake2bRead
 
 /// We will replace BLAKE2b with an algebraic hash function in a later version.
 #[derive(Debug, Clone)]
@@ -293,14 +296,14 @@ impl<C: CurveAffine> EncodedChallenge<C> for Challenge255<C> {
     }
 }
 
-pub(crate) fn read_n_points<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptRead<C, E>>(
+pub fn read_n_points<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptRead<C, E>>(
     transcript: &mut T,
     n: usize,
 ) -> io::Result<Vec<C>> {
     (0..n).map(|_| transcript.read_point()).collect()
 }
 
-pub(crate) fn read_n_scalars<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptRead<C, E>>(
+pub fn read_n_scalars<C: CurveAffine, E: EncodedChallenge<C>, T: TranscriptRead<C, E>>(
     transcript: &mut T,
     n: usize,
 ) -> io::Result<Vec<C::Scalar>> {

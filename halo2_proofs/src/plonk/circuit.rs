@@ -21,7 +21,7 @@ pub trait ColumnType:
 /// A column with an index and type
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct Column<C: ColumnType> {
-    index: usize,
+    pub index: usize,
     column_type: C,
 }
 
@@ -498,7 +498,7 @@ impl<F: Field> Expression<F> {
         instance_column: &impl Fn(usize, usize, Rotation) -> T,
         negated: &impl Fn(T) -> T,
         sum: &impl Fn(T, T) -> T,
-        product: &impl Fn(T, T) -> T,
+        product: &impl Fn(&dyn Fn() -> T, &dyn Fn() -> T) -> T,
         scaled: &impl Fn(T, F) -> T,
     ) -> T {
         match self {
@@ -559,29 +559,33 @@ impl<F: Field> Expression<F> {
                 sum(a, b)
             }
             Expression::Product(a, b) => {
-                let a = a.evaluate(
-                    constant,
-                    selector_column,
-                    fixed_column,
-                    advice_column,
-                    instance_column,
-                    negated,
-                    sum,
-                    product,
-                    scaled,
-                );
-                let b = b.evaluate(
-                    constant,
-                    selector_column,
-                    fixed_column,
-                    advice_column,
-                    instance_column,
-                    negated,
-                    sum,
-                    product,
-                    scaled,
-                );
-                product(a, b)
+                let a = || {
+                    a.evaluate(
+                        constant,
+                        selector_column,
+                        fixed_column,
+                        advice_column,
+                        instance_column,
+                        negated,
+                        sum,
+                        product,
+                        scaled,
+                    )
+                };
+                let b = || {
+                    b.evaluate(
+                        constant,
+                        selector_column,
+                        fixed_column,
+                        advice_column,
+                        instance_column,
+                        negated,
+                        sum,
+                        product,
+                        scaled,
+                    )
+                };
+                product(&a, &b)
             }
             Expression::Scaled(a, f) => {
                 let a = a.evaluate(
@@ -812,7 +816,7 @@ impl<F: Field> Expression<F> {
             &|_, _, _| false,
             &|a| a,
             &|a, b| a || b,
-            &|a, b| a || b,
+            &|a, b| a() || b(),
             &|a, _| a,
         )
     }
@@ -839,7 +843,13 @@ impl<F: Field> Expression<F> {
             &|_, _, _| None,
             &|a| a,
             &op,
-            &op,
+            &|a, b| match (a(), b()) {
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (Some(_), Some(_)) => {
+                    panic!("two simple selectors cannot be in the same expression")
+                }
+                _ => None,
+            },
             &|a, _| a,
         )
     }
@@ -939,10 +949,10 @@ impl<F: Field> From<Expression<F>> for Vec<Constraint<F>> {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Gate<F: Field> {
+pub struct Gate<F: Field> {
     name: &'static str,
     constraint_names: Vec<&'static str>,
-    polys: Vec<Expression<F>>,
+    pub polys: Vec<Expression<F>>,
     /// We track queried selectors separately from other cells, so that we can use them to
     /// trigger debug checks on gates.
     queried_selectors: Vec<Selector>,
@@ -976,25 +986,25 @@ impl<F: Field> Gate<F> {
 #[derive(Debug, Clone)]
 pub struct ConstraintSystem<F: Field> {
     pub(crate) num_fixed_columns: usize,
-    pub(crate) num_advice_columns: usize,
-    pub(crate) num_instance_columns: usize,
+    pub num_advice_columns: usize,
+    pub num_instance_columns: usize,
     pub(crate) num_selectors: usize,
     pub(crate) selector_map: Vec<Column<Fixed>>,
-    pub(crate) gates: Vec<Gate<F>>,
-    pub(crate) advice_queries: Vec<(Column<Advice>, Rotation)>,
+    pub gates: Vec<Gate<F>>,
+    pub advice_queries: Vec<(Column<Advice>, Rotation)>,
     // Contains an integer for each advice column
     // identifying how many distinct queries it has
     // so far; should be same length as num_advice_columns.
     num_advice_queries: Vec<usize>,
-    pub(crate) instance_queries: Vec<(Column<Instance>, Rotation)>,
-    pub(crate) fixed_queries: Vec<(Column<Fixed>, Rotation)>,
+    pub instance_queries: Vec<(Column<Instance>, Rotation)>,
+    pub fixed_queries: Vec<(Column<Fixed>, Rotation)>,
 
     // Permutation argument for performing equality constraints
-    pub(crate) permutation: permutation::Argument,
+    pub permutation: permutation::Argument,
 
     // Vector of lookup arguments, where each corresponds to a sequence of
     // input expressions and a sequence of table expressions involved in the lookup.
-    pub(crate) lookups: Vec<lookup::Argument<F>>,
+    pub lookups: Vec<lookup::Argument<F>>,
 
     // Vector of fixed columns, which can be used to store constant values
     // that are copied into advice columns.
@@ -1231,7 +1241,7 @@ impl<F: Field> ConstraintSystem<F> {
         panic!("get_instance_query_index called for non-existent query");
     }
 
-    pub(crate) fn get_any_query_index(&self, column: Column<Any>, at: Rotation) -> usize {
+    pub fn get_any_query_index(&self, column: Column<Any>, at: Rotation) -> usize {
         match column.column_type() {
             Any::Advice => {
                 self.get_advice_query_index(Column::<Advice>::try_from(column).unwrap(), at)
@@ -1391,7 +1401,7 @@ impl<F: Field> ConstraintSystem<F> {
                 },
                 &|a| -a,
                 &|a, b| a + b,
-                &|a, b| a * b,
+                &|a, b| a() * b(),
                 &|a, f| a * f,
             );
         }
